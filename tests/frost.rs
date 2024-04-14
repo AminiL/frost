@@ -11,8 +11,10 @@
 
 //! Integration tests for FROST.
 
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use ed25519_dalek::Verifier;
 
+use ice_frost::keygen::EncryptedSecretShare;
 use rand::rngs::OsRng;
 
 use ice_frost::compute_message_hash;
@@ -23,6 +25,100 @@ use ice_frost::Parameters;
 use ice_frost::Participant;
 
 use ice_frost::SignatureAggregator;
+
+#[test]
+fn keygen_rogue_key_attack_2_out_of_3_second_is_malicious() {
+    let params = Parameters { n: 3, t: 2 };
+    let mut rng = OsRng;
+
+    let (p1, p1coeffs, p1_dh_sk) = Participant::new_dealer(&params, 1, "Φ", &mut rng);
+    let (p2, p2coeffs, p2_dh_sk) = Participant::new_dealer(&params, 2, "Φ", &mut rng);
+    let (p3, p3coeffs, p3_dh_sk) = Participant::new_dealer(&params, 3, "Φ", &mut rng);
+
+    let mut p3_injected = p3.clone();
+    *p3_injected.commitments.as_mut().unwrap().points.get_mut(1).unwrap() += &RISTRETTO_BASEPOINT_POINT;
+
+    let participants_injected : Vec<Participant> = vec![p1.clone(), p2.clone(), p3_injected];
+    let participants: Vec<Participant> = vec![p1.clone(), p2.clone(), p3.clone()];
+
+    let (p1_state, _participant_lists) = DistributedKeyGeneration::<_>::new_initial(
+        &params,
+        &p1_dh_sk,
+        &p1.index,
+        &p1coeffs,
+        &participants_injected,
+        "Φ",
+        &mut rng,
+    )
+    .unwrap();
+    let p1_their_encrypted_secret_shares = p1_state.their_encrypted_secret_shares().unwrap();
+
+    let (p2_state, _participant_lists) = DistributedKeyGeneration::<_>::new_initial(
+        &params,
+        &p2_dh_sk,
+        &p2.index,
+        &p2coeffs,
+        &participants,
+        "Φ",
+        &mut rng,
+    )
+    .unwrap();
+    let p2_their_encrypted_secret_shares = p2_state.their_encrypted_secret_shares().unwrap();
+
+    let (p3_state, _participant_lists) = DistributedKeyGeneration::<_>::new_initial(
+        &params,
+        &p3_dh_sk,
+        &p3.index,
+        &p3coeffs,
+        &participants,
+        "Φ",
+        &mut rng,
+    )
+    .unwrap();
+    let p3_their_encrypted_secret_shares = p3_state.their_encrypted_secret_shares().unwrap();
+
+    let mut p3_their_encrypted_secret_shares_injected = p3_their_encrypted_secret_shares.clone();
+    {
+        let mut bytes_encrypted = p3_their_encrypted_secret_shares_injected.get(0).unwrap().to_bytes();
+        // attack works only if zero bit was equal to zero, because $> x \oplus 1 == x + 1 <$
+        assert!(bytes_encrypted[24] & 1 == 0);
+        bytes_encrypted[24] ^= 1;
+        *p3_their_encrypted_secret_shares_injected.get_mut(0).unwrap() = EncryptedSecretShare::from_bytes(&bytes_encrypted).unwrap();
+    }
+
+    let p1_my_encrypted_secret_shares = vec![
+        p1_their_encrypted_secret_shares[0].clone(),
+        p2_their_encrypted_secret_shares[0].clone(),
+        p3_their_encrypted_secret_shares_injected[0].clone(),
+    ];
+
+    let p2_my_encrypted_secret_shares = vec![
+        p1_their_encrypted_secret_shares[1].clone(),
+        p2_their_encrypted_secret_shares[1].clone(),
+        p3_their_encrypted_secret_shares[1].clone(),
+    ];
+
+    let p3_my_encrypted_secret_shares = vec![
+        p1_their_encrypted_secret_shares[2].clone(),
+        p2_their_encrypted_secret_shares[2].clone(),
+        p3_their_encrypted_secret_shares[2].clone(),
+    ];
+
+    let p1_state = p1_state
+        .to_round_two(p1_my_encrypted_secret_shares, &mut rng)
+    .unwrap();
+    let p2_state = p2_state
+        .to_round_two(p2_my_encrypted_secret_shares, &mut rng)
+    .unwrap();
+    let p3_state = p3_state
+        .to_round_two(p3_my_encrypted_secret_shares, &mut rng)
+    .unwrap();
+    let (p1_group_key, _) = p1_state.finish().unwrap();
+    let (p2_group_key, _) = p2_state.finish().unwrap();
+    let (p3_group_key, _) = p3_state.finish().unwrap();
+    assert!(p1_group_key == p2_group_key);
+    assert!(p2_group_key == p3_group_key);
+}
 
 #[test]
 fn signing_and_verification_3_out_of_5() {
